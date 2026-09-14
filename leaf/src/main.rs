@@ -272,6 +272,8 @@ const VEIN_WIDTH_PX: f32 = 1.4;
 
 const MERGE_DISTANCE: f64 = 0.022;
 
+const SPATIAL_INDEX_MIN_NODES: usize = 1500;
+
 const TOOTH_COUNT: f64 = 11.0;
 const TOOTH_DEPTH: f64 = 0.06;
 
@@ -439,6 +441,67 @@ fn dist2(a: &Point, b: &Point) -> f64 {
     dx * dx + dy * dy
 }
 
+use spade::{DelaunayTriangulation, HasPosition, Point2, Triangulation};
+
+struct IndexedVertex {
+    point: Point2<f64>,
+    node: usize,
+}
+
+impl HasPosition for IndexedVertex {
+    type Scalar = f64;
+    fn position(&self) -> Point2<f64> {
+        self.point
+    }
+}
+
+struct NodeIndex {
+    tri: DelaunayTriangulation<IndexedVertex>,
+    ok: bool,
+}
+
+impl NodeIndex {
+    fn build(graph: &VeinGraph) -> Self {
+        let mut tri: DelaunayTriangulation<IndexedVertex> = DelaunayTriangulation::new();
+        let mut ok = true;
+        for (i, nd) in graph.nodes.iter().enumerate() {
+            let v = IndexedVertex {
+                point: Point2::new(nd.pos.x.ada, nd.pos.y.ada),
+                node: i,
+            };
+            if tri.insert(v).is_err() {
+                ok = false;
+                break;
+            }
+        }
+        if tri.num_vertices() < 2 {
+            ok = false;
+        }
+        NodeIndex { tri, ok }
+    }
+
+    fn nearest(&self, graph: &VeinGraph, p: &Point) -> Option<usize> {
+        if self.ok
+            && let Some(vh) = self.tri.nearest_neighbor(Point2::new(p.x.ada, p.y.ada))
+        {
+            return Some(vh.data().node);
+        }
+        nearest_node_linear(graph, p)
+    }
+}
+
+fn nearest_node_linear(graph: &VeinGraph, p: &Point) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, nd) in graph.nodes.iter().enumerate() {
+        let d = dist2(&nd.pos, p);
+        match best {
+            Some((_, bd)) if d >= bd => {}
+            _ => best = Some((i, d)),
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 fn throw_darts(
     graph: &VeinGraph,
     b_s: BirthDistanceSource,
@@ -540,18 +603,6 @@ pub struct KillDistance {
     pub ada: f64,
 }
 
-fn nearest_node(graph: &VeinGraph, p: &Point) -> Option<VeinNodeId> {
-    let mut best: Option<(usize, f64)> = None;
-    for (i, nd) in graph.nodes.iter().enumerate() {
-        let d = dist2(&nd.pos, p);
-        match best {
-            Some((_, bd)) if d >= bd => {}
-            _ => best = Some((i, d)),
-        }
-    }
-    best.map(|(i, _)| VeinNodeId { ada: i })
-}
-
 fn venation_step(
     graph: &mut VeinGraph,
     sources: &mut Vec<Source>,
@@ -565,19 +616,31 @@ fn venation_step(
         return 0;
     }
 
+    let index = if graph.nodes.len() >= SPATIAL_INDEX_MIN_NODES {
+        Some(NodeIndex::build(graph))
+    } else {
+        None
+    };
+    let nearest = |g: &VeinGraph, p: &Point| -> Option<usize> {
+        match &index {
+            Some(idx) => idx.nearest(g, p),
+            None => nearest_node_linear(g, p),
+        }
+    };
+
     let mut influence: Vec<(f64, f64)> = vec![(0.0, 0.0); graph.nodes.len()];
     let mut has_influence = vec![false; graph.nodes.len()];
 
     for s in sources.iter() {
-        if let Some(v) = nearest_node(graph, &s.pos) {
-            let vpos = graph.nodes[v.ada].pos;
+        if let Some(v) = nearest(graph, &s.pos) {
+            let vpos = graph.nodes[v].pos;
             let dx = s.pos.x.ada - vpos.x.ada;
             let dy = s.pos.y.ada - vpos.y.ada;
             let len = (dx * dx + dy * dy).sqrt();
             if len > 1e-12 {
-                influence[v.ada].0 += dx / len;
-                influence[v.ada].1 += dy / len;
-                has_influence[v.ada] = true;
+                influence[v].0 += dx / len;
+                influence[v].1 += dy / len;
+                has_influence[v] = true;
             }
         }
     }
@@ -620,9 +683,19 @@ enum VenationMode {
     Closed,
 }
 
-fn source_influences_node(graph: &VeinGraph, s: &Point, v: usize) -> bool {
+fn source_influences_node(graph: &VeinGraph, index: &NodeIndex, s: &Point, v: usize) -> bool {
     let vpos = graph.nodes[v].pos;
     let d_sv = dist2(s, &vpos);
+
+    if let Some(w0) = index.nearest(graph, s)
+        && w0 != v
+    {
+        let nd = graph.nodes[w0].pos;
+        if dist2(s, &nd) < d_sv && dist2(&vpos, &nd) < d_sv {
+            return false;
+        }
+    }
+
     for (w, nd) in graph.nodes.iter().enumerate() {
         if w == v {
             continue;
@@ -649,12 +722,14 @@ fn venation_step_closed(
         return 0;
     }
 
+    let index = NodeIndex::build(graph);
+
     let mut influence: Vec<(f64, f64)> = vec![(0.0, 0.0); graph.nodes.len()];
     let mut has_influence = vec![false; graph.nodes.len()];
 
     for s in sources.iter() {
         for v in 0..graph.nodes.len() {
-            if !source_influences_node(graph, &s.pos, v) {
+            if !source_influences_node(graph, &index, &s.pos, v) {
                 continue;
             }
             let vpos = graph.nodes[v].pos;
@@ -1111,13 +1186,18 @@ async fn main() {
             LeafForm::ToothedActinodromous => "toothed actinodromous",
         };
         let loops = (graph.edges.len() + 1).saturating_sub(graph.nodes.len());
+        let accel = match mode {
+            VenationMode::Closed => "Delaunay",
+            VenationMode::Open if graph.nodes.len() >= SPATIAL_INDEX_MIN_NODES => "Delaunay",
+            VenationMode::Open => "linear",
+        };
         let hud_title = format!(
-            "Step 8: leaf form = {form_name}   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
+            "Step 7+8: form = {form_name}   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
             if auto { "on" } else { "off" }
         );
         draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
         let hud_veins = format!(
-            "venation = {mode_name}  |  nodes = {}  edges = {}  loops = {loops}  n = {MURRAY_EXPONENT:.1}  max r = {max_radius:.1}",
+            "venation = {mode_name} [{accel} NN]  |  nodes = {}  edges = {}  loops = {loops}  n = {MURRAY_EXPONENT:.1}  max r = {max_radius:.1}",
             graph.nodes.len(),
             graph.edges.len()
         );
