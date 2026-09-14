@@ -248,7 +248,7 @@ const T_MAX: f64 = 4.0;
 const Y0_MAX: f64 = 1.0;
 const N_STEPS: usize = 2048;
 
-fn reference_leaf() -> (Vec<Point>, Vec<Vec<Point>>) {
+fn reference_leaf() -> Vec<Point> {
     let n = 120usize;
     let mut outline = Vec::with_capacity(2 * n + 1);
     let width = |y: f64| {
@@ -264,32 +264,81 @@ fn reference_leaf() -> (Vec<Point>, Vec<Vec<Point>>) {
         outline.push(Point::new(PointX { ada: -width(y) }, PointY { ada: y }));
     }
 
-    let mut veins = Vec::new();
-    let midrib: Vec<Point> = (0..=n)
-        .map(|i| {
-            let y = Y0_MAX * i as f64 / n as f64;
-            Point::new(PointX { ada: 0.0 }, PointY { ada: y })
-        })
-        .collect();
-    veins.push(midrib);
+    outline
+}
 
-    for k in 1..=5 {
-        let base_y = Y0_MAX * k as f64 / 6.0;
-        let m = 24usize;
-        for sign in [-1.0f64, 1.0] {
-            let vein: Vec<Point> = (0..=m)
-                .map(|j| {
-                    let f = j as f64 / m as f64;
-                    let y = base_y + f * (width(base_y) * 0.9);
-                    let x = sign * f * width(base_y);
-                    Point::new(PointX { ada: x }, PointY { ada: y })
-                })
-                .collect();
-            veins.push(vein);
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct VeinNodeId {
+    pub ada: usize,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct VeinNode {
+    pos: Point,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct VeinEdge {
+    from: VeinNodeId,
+    to: VeinNodeId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VeinGraph {
+    nodes: Vec<VeinNode>,
+    edges: Vec<VeinEdge>,
+}
+
+impl VeinGraph {
+    fn new() -> Self {
+        VeinGraph {
+            nodes: Vec::new(),
+            edges: Vec::new(),
         }
     }
 
-    (outline, veins)
+    fn add_node(&mut self, pos: Point) -> VeinNodeId {
+        let id = VeinNodeId {
+            ada: self.nodes.len(),
+        };
+        self.nodes.push(VeinNode { pos });
+        id
+    }
+
+    #[allow(dead_code)]
+    fn add_edge(&mut self, from: VeinNodeId, to: VeinNodeId) {
+        self.edges.push(VeinEdge { from, to });
+    }
+}
+
+fn seed_graph() -> VeinGraph {
+    let mut g = VeinGraph::new();
+    g.add_node(Point::new(PointX { ada: 0.0 }, PointY { ada: 0.0 }));
+    g
+}
+
+fn propagate_graph<FL, FR>(
+    model: &GrowthModel<FL, FR>,
+    graph: &VeinGraph,
+    map_t0: &VerticalMap,
+    map_t: &VerticalMap,
+    t: f64,
+) -> VeinGraph
+where
+    FL: Fn(GrowthModelLeft) -> GrowthModelLeft,
+    FR: Fn(GrowthModelRight) -> GrowthModelRight,
+{
+    let nodes = graph
+        .nodes
+        .iter()
+        .map(|nd| VeinNode {
+            pos: model.propagate_point(nd.pos, T0, t, map_t0, map_t),
+        })
+        .collect();
+    VeinGraph {
+        nodes,
+        edges: graph.edges.clone(),
+    }
 }
 
 fn propagate_from_ref<FL, FR>(
@@ -350,6 +399,25 @@ fn draw_polyline(pts: &[Point], fit: &Fit, color: Color, thick: f32, closed: boo
     }
 }
 
+fn draw_vein_graph(graph: &VeinGraph, fit: &Fit, edge_color: Color, node_color: Color) {
+    for e in &graph.edges {
+        let a = &graph.nodes[e.from.ada].pos;
+        let b = &graph.nodes[e.to.ada].pos;
+        let (x1, y1) = to_screen(a, fit);
+        let (x2, y2) = to_screen(b, fit);
+        draw_line(x1, y1, x2, y2, 2.0, edge_color);
+    }
+    for (i, nd) in graph.nodes.iter().enumerate() {
+        let (sx, sy) = to_screen(&nd.pos, fit);
+        if i == 0 {
+            draw_circle_lines(sx, sy, 9.0, 2.0, node_color);
+            draw_circle(sx, sy, 4.5, node_color);
+        } else {
+            draw_circle(sx, sy, 3.5, node_color);
+        }
+    }
+}
+
 fn ref_bbox(t: f64) -> (f64, f64, f64, f64) {
     let sx = 1.30f64.powf(t);
     let sy = 1.25f64.powf(t);
@@ -367,7 +435,8 @@ async fn main() {
     };
     let model = GrowthModel::new(rerg_x, rerg_y, T0);
 
-    let (outline_ref, veins_ref) = reference_leaf();
+    let outline_ref = reference_leaf();
+    let graph_ref = seed_graph();
     let map_t0 = model.vertical_map(T0, Y0_MAX, N_STEPS);
 
     let mut t = T0;
@@ -376,7 +445,7 @@ async fn main() {
 
     let leaf_green = Color::new(0.20, 0.55, 0.25, 1.0);
     let vein_green = Color::new(0.35, 0.70, 0.40, 0.9);
-    let midrib_green = Color::new(0.15, 0.45, 0.20, 1.0);
+    let node_yellow = Color::new(0.95, 0.85, 0.30, 1.0);
 
     loop {
         if is_key_pressed(KeyCode::Space) {
@@ -403,26 +472,20 @@ async fn main() {
 
         let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
         let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
-        let veins: Vec<Vec<Point>> = veins_ref
-            .iter()
-            .map(|v| propagate_from_ref(&model, v, &map_t0, &map_t, t))
-            .collect();
+        let graph = propagate_graph(&model, &graph_ref, &map_t0, &map_t, t);
 
         let fit = fit_world(ref_bbox(T_MAX));
 
         clear_background(Color::new(0.08, 0.09, 0.11, 1.0));
 
-        for (i, v) in veins.iter().enumerate() {
-            let c = if i == 0 { midrib_green } else { vein_green };
-            let thick = if i == 0 { 2.5 } else { 1.5 };
-            draw_polyline(v, &fit, c, thick, false);
-        }
         draw_polyline(&outline, &fit, leaf_green, 2.5, true);
 
         for &p in outline.iter().step_by(20) {
             let (sx, sy) = to_screen(&p, &fit);
             draw_circle(sx, sy, 2.5, leaf_green);
         }
+
+        draw_vein_graph(&graph, &fit, vein_green, node_yellow);
 
         let hud_t = format!("t = {t:.2}   (t0 = {T0:.1}, t_max = {T_MAX:.1})");
         draw_text(&hud_t, 20.0, 30.0, 26.0, WHITE);
@@ -432,6 +495,12 @@ async fn main() {
             map_t.forward(0.05) / 0.05
         );
         draw_text(&hud_stretch, 20.0, 56.0, 22.0, LIGHTGRAY);
+        let hud_graph = format!(
+            "Step 1: vein graph seeded  |  nodes = {}  edges = {}  (petiole node carried by growth)",
+            graph.nodes.len(),
+            graph.edges.len()
+        );
+        draw_text(&hud_graph, 20.0, 82.0, 22.0, node_yellow);
         draw_text(
             "[space] play/pause   [<-]/[->] scrub   [r] reset",
             20.0,
