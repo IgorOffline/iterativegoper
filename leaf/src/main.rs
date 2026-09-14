@@ -248,20 +248,39 @@ const T_MAX: f64 = 4.0;
 const Y0_MAX: f64 = 1.0;
 const N_STEPS: usize = 2048;
 
+const BIRTH_DIST_SOURCE: f64 = 0.045;
+const BIRTH_DIST_VEIN: f64 = 0.045;
+const DART_ATTEMPTS: usize = 20000;
+
+fn leaf_half_width(y: f64) -> f64 {
+    let s = (std::f64::consts::PI * y).sin();
+    0.42 * s * (1.0 - 0.35 * y)
+}
+
+fn point_in_blade(x: f64, y: f64) -> bool {
+    (0.0..=Y0_MAX).contains(&y) && x.abs() <= leaf_half_width(y)
+}
+
 fn reference_leaf() -> Vec<Point> {
     let n = 120usize;
     let mut outline = Vec::with_capacity(2 * n + 1);
-    let width = |y: f64| {
-        let s = (std::f64::consts::PI * y).sin();
-        0.42 * s * (1.0 - 0.35 * y)
-    };
     for i in 0..=n {
         let y = Y0_MAX * i as f64 / n as f64;
-        outline.push(Point::new(PointX { ada: width(y) }, PointY { ada: y }));
+        outline.push(Point::new(
+            PointX {
+                ada: leaf_half_width(y),
+            },
+            PointY { ada: y },
+        ));
     }
     for i in (0..=n).rev() {
         let y = Y0_MAX * i as f64 / n as f64;
-        outline.push(Point::new(PointX { ada: -width(y) }, PointY { ada: y }));
+        outline.push(Point::new(
+            PointX {
+                ada: -leaf_half_width(y),
+            },
+            PointY { ada: y },
+        ));
     }
 
     outline
@@ -315,6 +334,86 @@ fn seed_graph() -> VeinGraph {
     let mut g = VeinGraph::new();
     g.add_node(Point::new(PointX { ada: 0.0 }, PointY { ada: 0.0 }));
     g
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct Source {
+    pos: Point,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct BirthDistanceSource {
+    pub ada: f64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct BirthDistanceVein {
+    pub ada: f64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct DartAttempts {
+    pub ada: usize,
+}
+
+fn dist2(a: &Point, b: &Point) -> f64 {
+    let dx = a.x.ada - b.x.ada;
+    let dy = a.y.ada - b.y.ada;
+    dx * dx + dy * dy
+}
+
+fn throw_darts(
+    graph: &VeinGraph,
+    b_s: BirthDistanceSource,
+    b_v: BirthDistanceVein,
+    attempts: DartAttempts,
+) -> Vec<Source> {
+    let b_s = b_s.ada;
+    let b_v = b_v.ada;
+    let b_s2 = b_s * b_s;
+    let b_v2 = b_v * b_v;
+
+    let mut sources: Vec<Source> = Vec::new();
+    for _ in 0..attempts.ada {
+        let y = rand::gen_range(0.0f64, Y0_MAX);
+        let hw = leaf_half_width(y);
+        let x = rand::gen_range(-hw, hw);
+        if !point_in_blade(x, y) {
+            continue;
+        }
+        let cand = Point::new(PointX { ada: x }, PointY { ada: y });
+
+        let far_from_sources = sources.iter().all(|s| dist2(&s.pos, &cand) >= b_s2);
+        if !far_from_sources {
+            continue;
+        }
+        let far_from_veins = graph.nodes.iter().all(|nd| dist2(&nd.pos, &cand) >= b_v2);
+        if !far_from_veins {
+            continue;
+        }
+
+        sources.push(Source { pos: cand });
+    }
+    sources
+}
+
+fn propagate_sources<FL, FR>(
+    model: &GrowthModel<FL, FR>,
+    sources: &[Source],
+    map_t0: &VerticalMap,
+    map_t: &VerticalMap,
+    t: f64,
+) -> Vec<Source>
+where
+    FL: Fn(GrowthModelLeft) -> GrowthModelLeft,
+    FR: Fn(GrowthModelRight) -> GrowthModelRight,
+{
+    sources
+        .iter()
+        .map(|s| Source {
+            pos: model.propagate_point(s.pos, T0, t, map_t0, map_t),
+        })
+        .collect()
 }
 
 fn propagate_graph<FL, FR>(
@@ -418,6 +517,13 @@ fn draw_vein_graph(graph: &VeinGraph, fit: &Fit, edge_color: Color, node_color: 
     }
 }
 
+fn draw_sources(sources: &[Source], fit: &Fit, color: Color) {
+    for s in sources {
+        let (sx, sy) = to_screen(&s.pos, fit);
+        draw_circle(sx, sy, 2.5, color);
+    }
+}
+
 fn ref_bbox(t: f64) -> (f64, f64, f64, f64) {
     let sx = 1.30f64.powf(t);
     let sy = 1.25f64.powf(t);
@@ -439,6 +545,20 @@ async fn main() {
     let graph_ref = seed_graph();
     let map_t0 = model.vertical_map(T0, Y0_MAX, N_STEPS);
 
+    let dart = |graph: &VeinGraph| {
+        throw_darts(
+            graph,
+            BirthDistanceSource {
+                ada: BIRTH_DIST_SOURCE,
+            },
+            BirthDistanceVein {
+                ada: BIRTH_DIST_VEIN,
+            },
+            DartAttempts { ada: DART_ATTEMPTS },
+        )
+    };
+    let mut sources_ref = dart(&graph_ref);
+
     let mut t = T0;
     let mut playing = true;
     let speed = 0.6f64;
@@ -446,6 +566,7 @@ async fn main() {
     let leaf_green = Color::new(0.20, 0.55, 0.25, 1.0);
     let vein_green = Color::new(0.35, 0.70, 0.40, 0.9);
     let node_yellow = Color::new(0.95, 0.85, 0.30, 1.0);
+    let source_blue = Color::new(0.45, 0.70, 0.95, 0.9);
 
     loop {
         if is_key_pressed(KeyCode::Space) {
@@ -453,6 +574,9 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::R) {
             t = T0;
+        }
+        if is_key_pressed(KeyCode::S) {
+            sources_ref = dart(&graph_ref);
         }
         let step = 0.05f64;
         if is_key_down(KeyCode::Right) {
@@ -473,6 +597,7 @@ async fn main() {
         let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
         let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
         let graph = propagate_graph(&model, &graph_ref, &map_t0, &map_t, t);
+        let sources = propagate_sources(&model, &sources_ref, &map_t0, &map_t, t);
 
         let fit = fit_world(ref_bbox(T_MAX));
 
@@ -485,6 +610,7 @@ async fn main() {
             draw_circle(sx, sy, 2.5, leaf_green);
         }
 
+        draw_sources(&sources, &fit, source_blue);
         draw_vein_graph(&graph, &fit, vein_green, node_yellow);
 
         let hud_t = format!("t = {t:.2}   (t0 = {T0:.1}, t_max = {T_MAX:.1})");
@@ -495,14 +621,19 @@ async fn main() {
             map_t.forward(0.05) / 0.05
         );
         draw_text(&hud_stretch, 20.0, 56.0, 22.0, LIGHTGRAY);
+        let hud_sources = format!(
+            "Step 2: auxin sources (dart-throwing)  |  sources = {}  b_s = {BIRTH_DIST_SOURCE:.3}  b_v = {BIRTH_DIST_VEIN:.3}",
+            sources.len()
+        );
+        draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
         let hud_graph = format!(
-            "Step 1: vein graph seeded  |  nodes = {}  edges = {}  (petiole node carried by growth)",
+            "vein graph  |  nodes = {}  edges = {}  (no veins grow yet)",
             graph.nodes.len(),
             graph.edges.len()
         );
-        draw_text(&hud_graph, 20.0, 82.0, 22.0, node_yellow);
+        draw_text(&hud_graph, 20.0, 106.0, 22.0, node_yellow);
         draw_text(
-            "[space] play/pause   [<-]/[->] scrub   [r] reset",
+            "[space] play/pause   [<-]/[->] scrub   [r] reset   [s] re-throw sources",
             20.0,
             screen_height() - 16.0,
             20.0,
