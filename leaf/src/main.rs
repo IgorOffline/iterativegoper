@@ -223,6 +223,12 @@ where
         Point::new(PointX { ada: x2 }, PointY { ada: y2 })
     }
 
+    fn unpropagate_point(&self, p: Point, t: f64, map_t: &VerticalMap) -> Point {
+        let y0 = map_t.inverse(p.y.ada);
+        let x0 = p.x.ada / self.rerg_x_at(y0).powf(t - self.t0);
+        Point::new(PointX { ada: x0 }, PointY { ada: y0 })
+    }
+
     #[allow(dead_code)]
     fn propagate_all(
         &self,
@@ -255,6 +261,10 @@ const DART_ATTEMPTS: usize = 20000;
 const VEIN_GROWTH_STEP: f64 = 0.018;
 const KILL_DISTANCE: f64 = 0.030;
 const AUTO_STEP_INTERVAL: f64 = 0.05;
+
+const DEV_DT: f64 = 0.06;
+const VENATION_SUBSTEPS: usize = 3;
+const DART_ATTEMPTS_CYCLE: usize = 4000;
 
 fn leaf_half_width(y: f64) -> f64 {
     let s = (std::f64::consts::PI * y).sin();
@@ -400,24 +410,60 @@ fn throw_darts(
     sources
 }
 
-#[allow(dead_code)]
-fn propagate_sources<FL, FR>(
+fn point_in_current_blade<FL, FR>(
     model: &GrowthModel<FL, FR>,
-    sources: &[Source],
-    map_t0: &VerticalMap,
-    map_t: &VerticalMap,
+    p: Point,
     t: f64,
+    map_t: &VerticalMap,
+) -> bool
+where
+    FL: Fn(GrowthModelLeft) -> GrowthModelLeft,
+    FR: Fn(GrowthModelRight) -> GrowthModelRight,
+{
+    let r = model.unpropagate_point(p, t, map_t);
+    point_in_blade(r.x.ada, r.y.ada)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn throw_darts_current<FL, FR>(
+    model: &GrowthModel<FL, FR>,
+    t: f64,
+    map_t: &VerticalMap,
+    graph: &VeinGraph,
+    existing: &[Source],
+    bbox: (f64, f64, f64, f64),
+    b_s: BirthDistanceSource,
+    b_v: BirthDistanceVein,
+    attempts: DartAttempts,
 ) -> Vec<Source>
 where
     FL: Fn(GrowthModelLeft) -> GrowthModelLeft,
     FR: Fn(GrowthModelRight) -> GrowthModelRight,
 {
-    sources
-        .iter()
-        .map(|s| Source {
-            pos: model.propagate_point(s.pos, T0, t, map_t0, map_t),
-        })
-        .collect()
+    let b_s2 = b_s.ada * b_s.ada;
+    let b_v2 = b_v.ada * b_v.ada;
+    let (minx, maxx, miny, maxy) = bbox;
+
+    let mut fresh: Vec<Source> = Vec::new();
+    for _ in 0..attempts.ada {
+        let x = rand::gen_range(minx, maxx);
+        let y = rand::gen_range(miny, maxy);
+        let cand = Point::new(PointX { ada: x }, PointY { ada: y });
+        if !point_in_current_blade(model, cand, t, map_t) {
+            continue;
+        }
+        if existing.iter().any(|s| dist2(&s.pos, &cand) < b_s2) {
+            continue;
+        }
+        if fresh.iter().any(|s| dist2(&s.pos, &cand) < b_s2) {
+            continue;
+        }
+        if graph.nodes.iter().any(|nd| dist2(&nd.pos, &cand) < b_v2) {
+            continue;
+        }
+        fresh.push(Source { pos: cand });
+    }
+    fresh
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -504,28 +550,35 @@ fn venation_step(
     spawned
 }
 
-#[allow(dead_code)]
-fn propagate_graph<FL, FR>(
+fn displace_graph<FL, FR>(
     model: &GrowthModel<FL, FR>,
-    graph: &VeinGraph,
-    map_t0: &VerticalMap,
-    map_t: &VerticalMap,
-    t: f64,
-) -> VeinGraph
-where
+    graph: &mut VeinGraph,
+    t1: f64,
+    t2: f64,
+    map_t1: &VerticalMap,
+    map_t2: &VerticalMap,
+) where
     FL: Fn(GrowthModelLeft) -> GrowthModelLeft,
     FR: Fn(GrowthModelRight) -> GrowthModelRight,
 {
-    let nodes = graph
-        .nodes
-        .iter()
-        .map(|nd| VeinNode {
-            pos: model.propagate_point(nd.pos, T0, t, map_t0, map_t),
-        })
-        .collect();
-    VeinGraph {
-        nodes,
-        edges: graph.edges.clone(),
+    for nd in graph.nodes.iter_mut() {
+        nd.pos = model.propagate_point(nd.pos, t1, t2, map_t1, map_t2);
+    }
+}
+
+fn displace_sources<FL, FR>(
+    model: &GrowthModel<FL, FR>,
+    sources: &mut [Source],
+    t1: f64,
+    t2: f64,
+    map_t1: &VerticalMap,
+    map_t2: &VerticalMap,
+) where
+    FL: Fn(GrowthModelLeft) -> GrowthModelLeft,
+    FR: Fn(GrowthModelRight) -> GrowthModelRight,
+{
+    for s in sources.iter_mut() {
+        s.pos = model.propagate_point(s.pos, t1, t2, map_t1, map_t2);
     }
 }
 
@@ -633,87 +686,107 @@ async fn main() {
     let outline_ref = reference_leaf();
     let map_t0 = model.vertical_map(T0, Y0_MAX, N_STEPS);
 
-    let dart = |graph: &VeinGraph| {
-        throw_darts(
-            graph,
-            BirthDistanceSource {
-                ada: BIRTH_DIST_SOURCE,
-            },
-            BirthDistanceVein {
-                ada: BIRTH_DIST_VEIN,
-            },
-            DartAttempts { ada: DART_ATTEMPTS },
-        )
-    };
-
-    // Step 3 is venation-first: time is frozen at T0 and veins grow in
-    // reference space. graph and sources are persistent, iterating state.
     let mut graph = seed_graph();
-    let mut sources = dart(&graph);
-    let initial_sources = sources.len();
-    let mut iteration = 0usize;
+    let mut sources: Vec<Source> = throw_darts(
+        &graph,
+        BirthDistanceSource {
+            ada: BIRTH_DIST_SOURCE,
+        },
+        BirthDistanceVein {
+            ada: BIRTH_DIST_VEIN,
+        },
+        DartAttempts { ada: DART_ATTEMPTS },
+    );
+    let mut t = T0;
+    let mut cycle = 0usize;
 
-    let t = T0;
-    let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
-    let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
-
-    let mut auto = false;
+    let mut auto = true;
     let mut auto_accum = 0.0f64;
-    let mut stall = 0usize;
-    let stall_limit = 400usize;
 
     let leaf_green = Color::new(0.20, 0.55, 0.25, 1.0);
     let vein_green = Color::new(0.35, 0.70, 0.40, 0.9);
     let node_yellow = Color::new(0.95, 0.85, 0.30, 1.0);
     let source_blue = Color::new(0.45, 0.70, 0.95, 0.9);
 
-    let do_step = |graph: &mut VeinGraph, sources: &mut Vec<Source>| {
-        venation_step(
+    let grow_cycle = |graph: &mut VeinGraph, sources: &mut Vec<Source>, t: &mut f64| {
+        if *t >= T_MAX {
+            return;
+        }
+        let t1 = *t;
+        let t2 = (t1 + DEV_DT).min(T_MAX);
+        let map_t1 = model.vertical_map(t1, Y0_MAX, N_STEPS);
+        let map_t2 = model.vertical_map(t2, Y0_MAX, N_STEPS);
+
+        displace_graph(&model, graph, t1, t2, &map_t1, &map_t2);
+        displace_sources(&model, sources, t1, t2, &map_t1, &map_t2);
+        *t = t2;
+
+        let fresh = throw_darts_current(
+            &model,
+            t2,
+            &map_t2,
             graph,
             sources,
-            GrowthStep {
-                ada: VEIN_GROWTH_STEP,
+            ref_bbox(t2),
+            BirthDistanceSource {
+                ada: BIRTH_DIST_SOURCE,
             },
-            KillDistance { ada: KILL_DISTANCE },
-        )
+            BirthDistanceVein {
+                ada: BIRTH_DIST_VEIN,
+            },
+            DartAttempts {
+                ada: DART_ATTEMPTS_CYCLE,
+            },
+        );
+        sources.extend(fresh);
+
+        for _ in 0..VENATION_SUBSTEPS {
+            venation_step(
+                graph,
+                sources,
+                GrowthStep {
+                    ada: VEIN_GROWTH_STEP,
+                },
+                KillDistance { ada: KILL_DISTANCE },
+            );
+        }
     };
 
     loop {
         if is_key_pressed(KeyCode::Space) {
             auto = !auto;
         }
-        if is_key_pressed(KeyCode::N) {
-            do_step(&mut graph, &mut sources);
-            iteration += 1;
+        if is_key_pressed(KeyCode::C) {
+            grow_cycle(&mut graph, &mut sources, &mut t);
+            cycle += 1;
         }
         if is_key_pressed(KeyCode::R) {
             graph = seed_graph();
-            sources = dart(&graph);
-            iteration = 0;
-            auto = false;
-            stall = 0;
+            sources = throw_darts(
+                &graph,
+                BirthDistanceSource {
+                    ada: BIRTH_DIST_SOURCE,
+                },
+                BirthDistanceVein {
+                    ada: BIRTH_DIST_VEIN,
+                },
+                DartAttempts { ada: DART_ATTEMPTS },
+            );
+            t = T0;
+            cycle = 0;
+            auto = true;
         }
-        if is_key_pressed(KeyCode::S) {
-            sources = dart(&graph);
-            stall = 0;
-        }
-        if auto && !sources.is_empty() && stall < stall_limit {
+        if auto && t < T_MAX {
             auto_accum += get_frame_time() as f64;
             while auto_accum >= AUTO_STEP_INTERVAL {
                 auto_accum -= AUTO_STEP_INTERVAL;
-                let before = sources.len();
-                do_step(&mut graph, &mut sources);
-                iteration += 1;
-                if sources.len() < before {
-                    stall = 0;
-                } else {
-                    stall += 1;
-                }
-            }
-            if stall >= stall_limit {
-                auto = false;
+                grow_cycle(&mut graph, &mut sources, &mut t);
+                cycle += 1;
             }
         }
+
+        let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
+        let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
 
         let fit = fit_world(ref_bbox(T_MAX));
 
@@ -730,32 +803,28 @@ async fn main() {
         draw_vein_graph(&graph, &fit, vein_green, node_yellow);
 
         let hud_title = format!(
-            "Step 3: open venation (Eq. 1)   iteration = {iteration}   [auto: {}]",
+            "Step 4: growth + venation (Fig. 4 loop)   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
             if auto { "on" } else { "off" }
         );
         draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
         let hud_veins = format!(
-            "vein nodes = {}  edges = {}   |   D = {VEIN_GROWTH_STEP:.3}  d_k = {KILL_DISTANCE:.3}",
+            "vein nodes = {}  edges = {}   |   D = {VEIN_GROWTH_STEP:.3}  d_k = {KILL_DISTANCE:.3}  dt = {DEV_DT:.3}",
             graph.nodes.len(),
             graph.edges.len()
         );
         draw_text(&hud_veins, 20.0, 56.0, 22.0, node_yellow);
-        let status = if sources.is_empty() {
-            "  [complete: all sources consumed]"
-        } else if stall >= stall_limit {
-            "  [settled: remaining sources orphaned -- open pattern]"
+        let phase = if t >= T_MAX {
+            "  [mature: blade fully grown]"
         } else {
             ""
         };
         let hud_sources = format!(
-            "auxin sources: {} remaining of {} (consumed = {}){status}",
-            sources.len(),
-            initial_sources,
-            initial_sources.saturating_sub(sources.len())
+            "auxin sources active = {}   (seeded into newly-grown blade each cycle){phase}",
+            sources.len()
         );
         draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
         draw_text(
-            "[n] one step   [space] auto   [r] reset   [s] re-throw sources   (t frozen at t0 -- growth returns in Step 4)",
+            "[space] play/pause   [c] one cycle   [r] reset   (blade grows + veins fill together)",
             20.0,
             screen_height() - 16.0,
             20.0,
