@@ -266,6 +266,10 @@ const DEV_DT: f64 = 0.06;
 const VENATION_SUBSTEPS: usize = 3;
 const DART_ATTEMPTS_CYCLE: usize = 4000;
 
+const MURRAY_EXPONENT: f64 = 3.0;
+const TIP_RADIUS: f64 = 1.0;
+const VEIN_WIDTH_PX: f32 = 1.4;
+
 fn leaf_half_width(y: f64) -> f64 {
     let s = (std::f64::consts::PI * y).sin();
     0.42 * s * (1.0 - 0.35 * y)
@@ -550,6 +554,44 @@ fn venation_step(
     spawned
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct MurrayExponent {
+    pub ada: f64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct TipRadius {
+    pub ada: f64,
+}
+
+fn murray_radii(graph: &VeinGraph, n: MurrayExponent, r0: TipRadius) -> Vec<f64> {
+    let n = n.ada;
+    let r0 = r0.ada;
+    let count = graph.nodes.len();
+
+    let mut child_pow_sum = vec![0.0f64; count];
+    let mut has_child = vec![false; count];
+    let mut parent = vec![None::<usize>; count];
+    for e in &graph.edges {
+        parent[e.to.ada] = Some(e.from.ada);
+    }
+
+    let mut radius = vec![r0; count];
+    for v in (0..count).rev() {
+        radius[v] = if has_child[v] {
+            child_pow_sum[v].powf(1.0 / n)
+        } else {
+            r0
+        };
+        if let Some(p) = parent[v] {
+            child_pow_sum[p] += radius[v].powf(n);
+            has_child[p] = true;
+        }
+    }
+
+    radius
+}
+
 fn displace_graph<FL, FR>(
     model: &GrowthModel<FL, FR>,
     graph: &mut VeinGraph,
@@ -640,22 +682,25 @@ fn draw_polyline(pts: &[Point], fit: &Fit, color: Color, thick: f32, closed: boo
     }
 }
 
-fn draw_vein_graph(graph: &VeinGraph, fit: &Fit, edge_color: Color, node_color: Color) {
+fn draw_vein_graph(
+    graph: &VeinGraph,
+    radii: &[f64],
+    fit: &Fit,
+    edge_color: Color,
+    node_color: Color,
+) {
     for e in &graph.edges {
         let a = &graph.nodes[e.from.ada].pos;
         let b = &graph.nodes[e.to.ada].pos;
         let (x1, y1) = to_screen(a, fit);
         let (x2, y2) = to_screen(b, fit);
-        draw_line(x1, y1, x2, y2, 2.0, edge_color);
+        let w = (radii[e.to.ada] as f32 * VEIN_WIDTH_PX).max(1.0);
+        draw_line(x1, y1, x2, y2, w, edge_color);
     }
-    for (i, nd) in graph.nodes.iter().enumerate() {
+    if let Some(nd) = graph.nodes.first() {
         let (sx, sy) = to_screen(&nd.pos, fit);
-        if i == 0 {
-            draw_circle_lines(sx, sy, 9.0, 2.0, node_color);
-            draw_circle(sx, sy, 4.5, node_color);
-        } else {
-            draw_circle(sx, sy, 3.5, node_color);
-        }
+        draw_circle_lines(sx, sy, 9.0, 2.0, node_color);
+        draw_circle(sx, sy, 4.5, node_color);
     }
 }
 
@@ -799,16 +844,25 @@ async fn main() {
             draw_circle(sx, sy, 2.5, leaf_green);
         }
 
+        let radii = murray_radii(
+            &graph,
+            MurrayExponent {
+                ada: MURRAY_EXPONENT,
+            },
+            TipRadius { ada: TIP_RADIUS },
+        );
+        let max_radius = radii.iter().cloned().fold(0.0f64, f64::max);
+
         draw_sources(&sources, &fit, source_blue);
-        draw_vein_graph(&graph, &fit, vein_green, node_yellow);
+        draw_vein_graph(&graph, &radii, &fit, vein_green, node_yellow);
 
         let hud_title = format!(
-            "Step 4: growth + venation (Fig. 4 loop)   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
+            "Step 5: Murray's-law vein widths   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
             if auto { "on" } else { "off" }
         );
         draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
         let hud_veins = format!(
-            "vein nodes = {}  edges = {}   |   D = {VEIN_GROWTH_STEP:.3}  d_k = {KILL_DISTANCE:.3}  dt = {DEV_DT:.3}",
+            "vein nodes = {}  edges = {}   |   n = {MURRAY_EXPONENT:.1}  r0 = {TIP_RADIUS:.1}  max radius = {max_radius:.1}",
             graph.nodes.len(),
             graph.edges.len()
         );
@@ -824,7 +878,7 @@ async fn main() {
         );
         draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
         draw_text(
-            "[space] play/pause   [c] one cycle   [r] reset   (blade grows + veins fill together)",
+            "[space] play/pause   [c] one cycle   [r] reset   (veins thicken tip->base by Murray's law)",
             20.0,
             screen_height() - 16.0,
             20.0,
