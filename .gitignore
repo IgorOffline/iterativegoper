@@ -1,0 +1,6 @@
+.idea
+target
+Cargo.lock
+report_*.txt
+input_*.txt
+old_*.txt
