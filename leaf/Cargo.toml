@@ -1,0 +1,8 @@
+[package]
+name = "leaf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macroquad = "0.4.16"
+spade = "2.15.1"
