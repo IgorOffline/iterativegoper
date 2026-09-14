@@ -272,9 +272,54 @@ const VEIN_WIDTH_PX: f32 = 1.4;
 
 const MERGE_DISTANCE: f64 = 0.022;
 
+const TOOTH_COUNT: f64 = 11.0;
+const TOOTH_DEPTH: f64 = 0.06;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum LeafForm {
+    SmoothPinnate,
+    ToothedPinnate,
+    ToothedActinodromous,
+}
+
+static LEAF_FORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn set_leaf_form(f: LeafForm) {
+    let v = match f {
+        LeafForm::SmoothPinnate => 0,
+        LeafForm::ToothedPinnate => 1,
+        LeafForm::ToothedActinodromous => 2,
+    };
+    LEAF_FORM.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn leaf_form() -> LeafForm {
+    match LEAF_FORM.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => LeafForm::ToothedPinnate,
+        2 => LeafForm::ToothedActinodromous,
+        _ => LeafForm::SmoothPinnate,
+    }
+}
+
+fn triangular_wave(u: f64, period: f64) -> f64 {
+    let phase = (u / period).rem_euclid(1.0);
+    1.0 - (2.0 * phase - 1.0).abs()
+}
+
+fn tooth_offset(y: f64) -> f64 {
+    let taper = (std::f64::consts::PI * y).sin();
+    let primary = triangular_wave(y, 1.0 / TOOTH_COUNT);
+    let secondary = 0.4 * triangular_wave(y, 1.0 / (2.0 * TOOTH_COUNT));
+    TOOTH_DEPTH * taper * (primary + secondary)
+}
+
 fn leaf_half_width(y: f64) -> f64 {
     let s = (std::f64::consts::PI * y).sin();
-    0.42 * s * (1.0 - 0.35 * y)
+    let base = 0.42 * s * (1.0 - 0.35 * y);
+    match leaf_form() {
+        LeafForm::SmoothPinnate => base,
+        LeafForm::ToothedPinnate | LeafForm::ToothedActinodromous => base + tooth_offset(y),
+    }
 }
 
 fn point_in_blade(x: f64, y: f64) -> bool {
@@ -282,7 +327,7 @@ fn point_in_blade(x: f64, y: f64) -> bool {
 }
 
 fn reference_leaf() -> Vec<Point> {
-    let n = 120usize;
+    let n = 400usize;
     let mut outline = Vec::with_capacity(2 * n + 1);
     for i in 0..=n {
         let y = Y0_MAX * i as f64 / n as f64;
@@ -351,7 +396,20 @@ impl VeinGraph {
 
 fn seed_graph() -> VeinGraph {
     let mut g = VeinGraph::new();
-    g.add_node(Point::new(PointX { ada: 0.0 }, PointY { ada: 0.0 }));
+    let root = g.add_node(Point::new(PointX { ada: 0.0 }, PointY { ada: 0.0 }));
+
+    if leaf_form() == LeafForm::ToothedActinodromous {
+        let primaries = 5usize;
+        let stub = 0.05f64;
+        for k in 0..primaries {
+            let frac = (k as f64 + 0.5) / primaries as f64;
+            let angle = (frac - 0.5) * std::f64::consts::PI * 0.9;
+            let px = stub * angle.sin();
+            let py = (stub * angle.cos()).max(1e-3);
+            let id = g.add_node(Point::new(PointX { ada: px }, PointY { ada: py }));
+            g.add_edge(root, id);
+        }
+    }
     g
 }
 
@@ -857,7 +915,10 @@ async fn main() {
     };
     let model = GrowthModel::new(rerg_x, rerg_y, T0);
 
-    let outline_ref = reference_leaf();
+    set_leaf_form(LeafForm::SmoothPinnate);
+    let mut form = LeafForm::SmoothPinnate;
+
+    let mut outline_ref = reference_leaf();
     let map_t0 = model.vertical_map(T0, Y0_MAX, N_STEPS);
 
     let mut graph = seed_graph();
@@ -966,6 +1027,29 @@ async fn main() {
             cycle = 0;
             auto = true;
         }
+        if is_key_pressed(KeyCode::M) {
+            form = match form {
+                LeafForm::SmoothPinnate => LeafForm::ToothedPinnate,
+                LeafForm::ToothedPinnate => LeafForm::ToothedActinodromous,
+                LeafForm::ToothedActinodromous => LeafForm::SmoothPinnate,
+            };
+            set_leaf_form(form);
+            outline_ref = reference_leaf();
+            graph = seed_graph();
+            sources = throw_darts(
+                &graph,
+                BirthDistanceSource {
+                    ada: BIRTH_DIST_SOURCE,
+                },
+                BirthDistanceVein {
+                    ada: BIRTH_DIST_VEIN,
+                },
+                DartAttempts { ada: DART_ATTEMPTS },
+            );
+            t = T0;
+            cycle = 0;
+            auto = true;
+        }
         if is_key_pressed(KeyCode::R) {
             graph = seed_graph();
             sources = throw_darts(
@@ -1000,7 +1084,7 @@ async fn main() {
 
         draw_polyline(&outline, &fit, leaf_green, 2.5, true);
 
-        for &p in outline.iter().step_by(20) {
+        for &p in outline.iter().step_by(66) {
             let (sx, sy) = to_screen(&p, &fit);
             draw_circle(sx, sy, 2.5, leaf_green);
         }
@@ -1018,17 +1102,22 @@ async fn main() {
         draw_vein_graph(&graph, &radii, &fit, vein_green, node_yellow);
 
         let mode_name = match mode {
-            VenationMode::Open => "OPEN (tree)",
-            VenationMode::Closed => "CLOSED (reticulate)",
+            VenationMode::Open => "open",
+            VenationMode::Closed => "closed",
+        };
+        let form_name = match form {
+            LeafForm::SmoothPinnate => "smooth pinnate",
+            LeafForm::ToothedPinnate => "toothed pinnate",
+            LeafForm::ToothedActinodromous => "toothed actinodromous",
         };
         let loops = (graph.edges.len() + 1).saturating_sub(graph.nodes.len());
         let hud_title = format!(
-            "Step 6: {mode_name}   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
+            "Step 8: leaf form = {form_name}   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
             if auto { "on" } else { "off" }
         );
         draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
         let hud_veins = format!(
-            "vein nodes = {}  edges = {}  loops = {loops}   |   n = {MURRAY_EXPONENT:.1}  max radius = {max_radius:.1}",
+            "venation = {mode_name}  |  nodes = {}  edges = {}  loops = {loops}  n = {MURRAY_EXPONENT:.1}  max r = {max_radius:.1}",
             graph.nodes.len(),
             graph.edges.len()
         );
@@ -1044,7 +1133,7 @@ async fn main() {
         );
         draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
         draw_text(
-            "[space] play/pause   [c] one cycle   [o] open/closed   [r] reset   (closed = veins loop into anastomoses)",
+            "[m] leaf form   [o] open/closed   [space] play/pause   [c] one cycle   [r] reset",
             20.0,
             screen_height() - 16.0,
             20.0,
