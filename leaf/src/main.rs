@@ -252,6 +252,10 @@ const BIRTH_DIST_SOURCE: f64 = 0.045;
 const BIRTH_DIST_VEIN: f64 = 0.045;
 const DART_ATTEMPTS: usize = 20000;
 
+const VEIN_GROWTH_STEP: f64 = 0.018;
+const KILL_DISTANCE: f64 = 0.030;
+const AUTO_STEP_INTERVAL: f64 = 0.05;
+
 fn leaf_half_width(y: f64) -> f64 {
     let s = (std::f64::consts::PI * y).sin();
     0.42 * s * (1.0 - 0.35 * y)
@@ -324,7 +328,6 @@ impl VeinGraph {
         id
     }
 
-    #[allow(dead_code)]
     fn add_edge(&mut self, from: VeinNodeId, to: VeinNodeId) {
         self.edges.push(VeinEdge { from, to });
     }
@@ -397,6 +400,7 @@ fn throw_darts(
     sources
 }
 
+#[allow(dead_code)]
 fn propagate_sources<FL, FR>(
     model: &GrowthModel<FL, FR>,
     sources: &[Source],
@@ -416,6 +420,91 @@ where
         .collect()
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct GrowthStep {
+    pub ada: f64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct KillDistance {
+    pub ada: f64,
+}
+
+fn nearest_node(graph: &VeinGraph, p: &Point) -> Option<VeinNodeId> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, nd) in graph.nodes.iter().enumerate() {
+        let d = dist2(&nd.pos, p);
+        match best {
+            Some((_, bd)) if d >= bd => {}
+            _ => best = Some((i, d)),
+        }
+    }
+    best.map(|(i, _)| VeinNodeId { ada: i })
+}
+
+fn venation_step(
+    graph: &mut VeinGraph,
+    sources: &mut Vec<Source>,
+    d: GrowthStep,
+    dk: KillDistance,
+) -> usize {
+    let d = d.ada;
+    let dk2 = dk.ada * dk.ada;
+
+    if sources.is_empty() || graph.nodes.is_empty() {
+        return 0;
+    }
+
+    let mut influence: Vec<(f64, f64)> = vec![(0.0, 0.0); graph.nodes.len()];
+    let mut has_influence = vec![false; graph.nodes.len()];
+
+    for s in sources.iter() {
+        if let Some(v) = nearest_node(graph, &s.pos) {
+            let vpos = graph.nodes[v.ada].pos;
+            let dx = s.pos.x.ada - vpos.x.ada;
+            let dy = s.pos.y.ada - vpos.y.ada;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-12 {
+                influence[v.ada].0 += dx / len;
+                influence[v.ada].1 += dy / len;
+                has_influence[v.ada] = true;
+            }
+        }
+    }
+
+    let mut spawned = 0usize;
+    let original_len = graph.nodes.len();
+    for v in 0..original_len {
+        if !has_influence[v] {
+            continue;
+        }
+        let (ax, ay) = influence[v];
+        let nlen = (ax * ax + ay * ay).sqrt();
+        if nlen <= 1e-12 {
+            continue;
+        }
+        let vpos = graph.nodes[v].pos;
+        let nx = ax / nlen;
+        let ny = ay / nlen;
+        let new_pos = Point::new(
+            PointX {
+                ada: vpos.x.ada + d * nx,
+            },
+            PointY {
+                ada: vpos.y.ada + d * ny,
+            },
+        );
+        let new_id = graph.add_node(new_pos);
+        graph.add_edge(VeinNodeId { ada: v }, new_id);
+        spawned += 1;
+    }
+
+    sources.retain(|s| graph.nodes.iter().all(|nd| dist2(&nd.pos, &s.pos) > dk2));
+
+    spawned
+}
+
+#[allow(dead_code)]
 fn propagate_graph<FL, FR>(
     model: &GrowthModel<FL, FR>,
     graph: &VeinGraph,
@@ -542,7 +631,6 @@ async fn main() {
     let model = GrowthModel::new(rerg_x, rerg_y, T0);
 
     let outline_ref = reference_leaf();
-    let graph_ref = seed_graph();
     let map_t0 = model.vertical_map(T0, Y0_MAX, N_STEPS);
 
     let dart = |graph: &VeinGraph| {
@@ -557,47 +645,75 @@ async fn main() {
             DartAttempts { ada: DART_ATTEMPTS },
         )
     };
-    let mut sources_ref = dart(&graph_ref);
 
-    let mut t = T0;
-    let mut playing = true;
-    let speed = 0.6f64;
+    // Step 3 is venation-first: time is frozen at T0 and veins grow in
+    // reference space. graph and sources are persistent, iterating state.
+    let mut graph = seed_graph();
+    let mut sources = dart(&graph);
+    let initial_sources = sources.len();
+    let mut iteration = 0usize;
+
+    let t = T0;
+    let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
+    let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
+
+    let mut auto = false;
+    let mut auto_accum = 0.0f64;
+    let mut stall = 0usize;
+    let stall_limit = 400usize;
 
     let leaf_green = Color::new(0.20, 0.55, 0.25, 1.0);
     let vein_green = Color::new(0.35, 0.70, 0.40, 0.9);
     let node_yellow = Color::new(0.95, 0.85, 0.30, 1.0);
     let source_blue = Color::new(0.45, 0.70, 0.95, 0.9);
 
+    let do_step = |graph: &mut VeinGraph, sources: &mut Vec<Source>| {
+        venation_step(
+            graph,
+            sources,
+            GrowthStep {
+                ada: VEIN_GROWTH_STEP,
+            },
+            KillDistance { ada: KILL_DISTANCE },
+        )
+    };
+
     loop {
         if is_key_pressed(KeyCode::Space) {
-            playing = !playing;
+            auto = !auto;
+        }
+        if is_key_pressed(KeyCode::N) {
+            do_step(&mut graph, &mut sources);
+            iteration += 1;
         }
         if is_key_pressed(KeyCode::R) {
-            t = T0;
+            graph = seed_graph();
+            sources = dart(&graph);
+            iteration = 0;
+            auto = false;
+            stall = 0;
         }
         if is_key_pressed(KeyCode::S) {
-            sources_ref = dart(&graph_ref);
+            sources = dart(&graph);
+            stall = 0;
         }
-        let step = 0.05f64;
-        if is_key_down(KeyCode::Right) {
-            playing = false;
-            t = (t + step).min(T_MAX);
-        }
-        if is_key_down(KeyCode::Left) {
-            playing = false;
-            t = (t - step).max(T0);
-        }
-        if playing {
-            t += speed * get_frame_time() as f64;
-            if t > T_MAX {
-                t = T0;
+        if auto && !sources.is_empty() && stall < stall_limit {
+            auto_accum += get_frame_time() as f64;
+            while auto_accum >= AUTO_STEP_INTERVAL {
+                auto_accum -= AUTO_STEP_INTERVAL;
+                let before = sources.len();
+                do_step(&mut graph, &mut sources);
+                iteration += 1;
+                if sources.len() < before {
+                    stall = 0;
+                } else {
+                    stall += 1;
+                }
+            }
+            if stall >= stall_limit {
+                auto = false;
             }
         }
-
-        let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
-        let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
-        let graph = propagate_graph(&model, &graph_ref, &map_t0, &map_t, t);
-        let sources = propagate_sources(&model, &sources_ref, &map_t0, &map_t, t);
 
         let fit = fit_world(ref_bbox(T_MAX));
 
@@ -613,27 +729,33 @@ async fn main() {
         draw_sources(&sources, &fit, source_blue);
         draw_vein_graph(&graph, &fit, vein_green, node_yellow);
 
-        let hud_t = format!("t = {t:.2}   (t0 = {T0:.1}, t_max = {T_MAX:.1})");
-        draw_text(&hud_t, 20.0, 30.0, 26.0, WHITE);
-        let hud_stretch = format!(
-            "x-stretch (base) = {:.2}x   y-stretch (base) = {:.2}x",
-            1.30f64.powf(t),
-            map_t.forward(0.05) / 0.05
+        let hud_title = format!(
+            "Step 3: open venation (Eq. 1)   iteration = {iteration}   [auto: {}]",
+            if auto { "on" } else { "off" }
         );
-        draw_text(&hud_stretch, 20.0, 56.0, 22.0, LIGHTGRAY);
-        let hud_sources = format!(
-            "Step 2: auxin sources (dart-throwing)  |  sources = {}  b_s = {BIRTH_DIST_SOURCE:.3}  b_v = {BIRTH_DIST_VEIN:.3}",
-            sources.len()
-        );
-        draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
-        let hud_graph = format!(
-            "vein graph  |  nodes = {}  edges = {}  (no veins grow yet)",
+        draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
+        let hud_veins = format!(
+            "vein nodes = {}  edges = {}   |   D = {VEIN_GROWTH_STEP:.3}  d_k = {KILL_DISTANCE:.3}",
             graph.nodes.len(),
             graph.edges.len()
         );
-        draw_text(&hud_graph, 20.0, 106.0, 22.0, node_yellow);
+        draw_text(&hud_veins, 20.0, 56.0, 22.0, node_yellow);
+        let status = if sources.is_empty() {
+            "  [complete: all sources consumed]"
+        } else if stall >= stall_limit {
+            "  [settled: remaining sources orphaned -- open pattern]"
+        } else {
+            ""
+        };
+        let hud_sources = format!(
+            "auxin sources: {} remaining of {} (consumed = {}){status}",
+            sources.len(),
+            initial_sources,
+            initial_sources.saturating_sub(sources.len())
+        );
+        draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
         draw_text(
-            "[space] play/pause   [<-]/[->] scrub   [r] reset   [s] re-throw sources",
+            "[n] one step   [space] auto   [r] reset   [s] re-throw sources   (t frozen at t0 -- growth returns in Step 4)",
             20.0,
             screen_height() - 16.0,
             20.0,
