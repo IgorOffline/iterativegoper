@@ -270,6 +270,8 @@ const MURRAY_EXPONENT: f64 = 3.0;
 const TIP_RADIUS: f64 = 1.0;
 const VEIN_WIDTH_PX: f32 = 1.4;
 
+const MERGE_DISTANCE: f64 = 0.022;
+
 fn leaf_half_width(y: f64) -> f64 {
     let s = (std::f64::consts::PI * y).sin();
     0.42 * s * (1.0 - 0.35 * y)
@@ -554,6 +556,127 @@ fn venation_step(
     spawned
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum VenationMode {
+    Open,
+    Closed,
+}
+
+fn source_influences_node(graph: &VeinGraph, s: &Point, v: usize) -> bool {
+    let vpos = graph.nodes[v].pos;
+    let d_sv = dist2(s, &vpos);
+    for (w, nd) in graph.nodes.iter().enumerate() {
+        if w == v {
+            continue;
+        }
+        let d_sw = dist2(s, &nd.pos);
+        let d_vw = dist2(&vpos, &nd.pos);
+        if d_sw < d_sv && d_vw < d_sv {
+            return false;
+        }
+    }
+    true
+}
+
+fn venation_step_closed(
+    graph: &mut VeinGraph,
+    sources: &mut Vec<Source>,
+    d: GrowthStep,
+    dk: KillDistance,
+) -> usize {
+    let d = d.ada;
+    let dk2 = dk.ada * dk.ada;
+
+    if sources.is_empty() || graph.nodes.is_empty() {
+        return 0;
+    }
+
+    let mut influence: Vec<(f64, f64)> = vec![(0.0, 0.0); graph.nodes.len()];
+    let mut has_influence = vec![false; graph.nodes.len()];
+
+    for s in sources.iter() {
+        for v in 0..graph.nodes.len() {
+            if !source_influences_node(graph, &s.pos, v) {
+                continue;
+            }
+            let vpos = graph.nodes[v].pos;
+            let dx = s.pos.x.ada - vpos.x.ada;
+            let dy = s.pos.y.ada - vpos.y.ada;
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-12 {
+                influence[v].0 += dx / len;
+                influence[v].1 += dy / len;
+                has_influence[v] = true;
+            }
+        }
+    }
+
+    let mut spawned = 0usize;
+    let original_len = graph.nodes.len();
+    for v in 0..original_len {
+        if !has_influence[v] {
+            continue;
+        }
+        let (ax, ay) = influence[v];
+        let nlen = (ax * ax + ay * ay).sqrt();
+        if nlen <= 1e-12 {
+            continue;
+        }
+        let vpos = graph.nodes[v].pos;
+        let nx = ax / nlen;
+        let ny = ay / nlen;
+        let new_pos = Point::new(
+            PointX {
+                ada: vpos.x.ada + d * nx,
+            },
+            PointY {
+                ada: vpos.y.ada + d * ny,
+            },
+        );
+        let new_id = graph.add_node(new_pos);
+        graph.add_edge(VeinNodeId { ada: v }, new_id);
+        spawned += 1;
+    }
+
+    close_loops(graph, original_len);
+
+    sources.retain(|s| graph.nodes.iter().all(|nd| dist2(&nd.pos, &s.pos) > dk2));
+
+    spawned
+}
+
+fn close_loops(graph: &mut VeinGraph, first_new: usize) {
+    let merge2 = MERGE_DISTANCE * MERGE_DISTANCE;
+    let mut new_edges: Vec<(usize, usize)> = Vec::new();
+    for nw in first_new..graph.nodes.len() {
+        let np = graph.nodes[nw].pos;
+        let parent = graph
+            .edges
+            .iter()
+            .find(|e| e.to.ada == nw)
+            .map(|e| e.from.ada);
+        let mut best: Option<(usize, f64)> = None;
+        for old in 0..first_new {
+            if Some(old) == parent {
+                continue;
+            }
+            let d = dist2(&np, &graph.nodes[old].pos);
+            if d <= merge2 {
+                match best {
+                    Some((_, bd)) if d >= bd => {}
+                    _ => best = Some((old, d)),
+                }
+            }
+        }
+        if let Some((old, _)) = best {
+            new_edges.push((nw, old));
+        }
+    }
+    for (nw, old) in new_edges {
+        graph.add_edge(VeinNodeId { ada: nw }, VeinNodeId { ada: old });
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct MurrayExponent {
     pub ada: f64,
@@ -573,7 +696,9 @@ fn murray_radii(graph: &VeinGraph, n: MurrayExponent, r0: TipRadius) -> Vec<f64>
     let mut has_child = vec![false; count];
     let mut parent = vec![None::<usize>; count];
     for e in &graph.edges {
-        parent[e.to.ada] = Some(e.from.ada);
+        if e.from.ada < e.to.ada {
+            parent[e.to.ada] = Some(e.from.ada);
+        }
     }
 
     let mut radius = vec![r0; count];
@@ -694,7 +819,11 @@ fn draw_vein_graph(
         let b = &graph.nodes[e.to.ada].pos;
         let (x1, y1) = to_screen(a, fit);
         let (x2, y2) = to_screen(b, fit);
-        let w = (radii[e.to.ada] as f32 * VEIN_WIDTH_PX).max(1.0);
+        let w = if e.from.ada < e.to.ada {
+            (radii[e.to.ada] as f32 * VEIN_WIDTH_PX).max(1.0)
+        } else {
+            1.0
+        };
         draw_line(x1, y1, x2, y2, w, edge_color);
     }
     if let Some(nd) = graph.nodes.first() {
@@ -744,6 +873,7 @@ async fn main() {
     );
     let mut t = T0;
     let mut cycle = 0usize;
+    let mut mode = VenationMode::Open;
 
     let mut auto = true;
     let mut auto_accum = 0.0f64;
@@ -753,57 +883,88 @@ async fn main() {
     let node_yellow = Color::new(0.95, 0.85, 0.30, 1.0);
     let source_blue = Color::new(0.45, 0.70, 0.95, 0.9);
 
-    let grow_cycle = |graph: &mut VeinGraph, sources: &mut Vec<Source>, t: &mut f64| {
-        if *t >= T_MAX {
-            return;
-        }
-        let t1 = *t;
-        let t2 = (t1 + DEV_DT).min(T_MAX);
-        let map_t1 = model.vertical_map(t1, Y0_MAX, N_STEPS);
-        let map_t2 = model.vertical_map(t2, Y0_MAX, N_STEPS);
+    let grow_cycle =
+        |graph: &mut VeinGraph, sources: &mut Vec<Source>, t: &mut f64, mode: VenationMode| {
+            if *t >= T_MAX {
+                return;
+            }
+            let t1 = *t;
+            let t2 = (t1 + DEV_DT).min(T_MAX);
+            let map_t1 = model.vertical_map(t1, Y0_MAX, N_STEPS);
+            let map_t2 = model.vertical_map(t2, Y0_MAX, N_STEPS);
 
-        displace_graph(&model, graph, t1, t2, &map_t1, &map_t2);
-        displace_sources(&model, sources, t1, t2, &map_t1, &map_t2);
-        *t = t2;
+            displace_graph(&model, graph, t1, t2, &map_t1, &map_t2);
+            displace_sources(&model, sources, t1, t2, &map_t1, &map_t2);
+            *t = t2;
 
-        let fresh = throw_darts_current(
-            &model,
-            t2,
-            &map_t2,
-            graph,
-            sources,
-            ref_bbox(t2),
-            BirthDistanceSource {
-                ada: BIRTH_DIST_SOURCE,
-            },
-            BirthDistanceVein {
-                ada: BIRTH_DIST_VEIN,
-            },
-            DartAttempts {
-                ada: DART_ATTEMPTS_CYCLE,
-            },
-        );
-        sources.extend(fresh);
-
-        for _ in 0..VENATION_SUBSTEPS {
-            venation_step(
+            let fresh = throw_darts_current(
+                &model,
+                t2,
+                &map_t2,
                 graph,
                 sources,
-                GrowthStep {
-                    ada: VEIN_GROWTH_STEP,
+                ref_bbox(t2),
+                BirthDistanceSource {
+                    ada: BIRTH_DIST_SOURCE,
                 },
-                KillDistance { ada: KILL_DISTANCE },
+                BirthDistanceVein {
+                    ada: BIRTH_DIST_VEIN,
+                },
+                DartAttempts {
+                    ada: DART_ATTEMPTS_CYCLE,
+                },
             );
-        }
-    };
+            sources.extend(fresh);
+
+            for _ in 0..VENATION_SUBSTEPS {
+                match mode {
+                    VenationMode::Open => venation_step(
+                        graph,
+                        sources,
+                        GrowthStep {
+                            ada: VEIN_GROWTH_STEP,
+                        },
+                        KillDistance { ada: KILL_DISTANCE },
+                    ),
+                    VenationMode::Closed => venation_step_closed(
+                        graph,
+                        sources,
+                        GrowthStep {
+                            ada: VEIN_GROWTH_STEP,
+                        },
+                        KillDistance { ada: KILL_DISTANCE },
+                    ),
+                };
+            }
+        };
 
     loop {
         if is_key_pressed(KeyCode::Space) {
             auto = !auto;
         }
         if is_key_pressed(KeyCode::C) {
-            grow_cycle(&mut graph, &mut sources, &mut t);
+            grow_cycle(&mut graph, &mut sources, &mut t, mode);
             cycle += 1;
+        }
+        if is_key_pressed(KeyCode::O) {
+            mode = match mode {
+                VenationMode::Open => VenationMode::Closed,
+                VenationMode::Closed => VenationMode::Open,
+            };
+            graph = seed_graph();
+            sources = throw_darts(
+                &graph,
+                BirthDistanceSource {
+                    ada: BIRTH_DIST_SOURCE,
+                },
+                BirthDistanceVein {
+                    ada: BIRTH_DIST_VEIN,
+                },
+                DartAttempts { ada: DART_ATTEMPTS },
+            );
+            t = T0;
+            cycle = 0;
+            auto = true;
         }
         if is_key_pressed(KeyCode::R) {
             graph = seed_graph();
@@ -825,7 +986,7 @@ async fn main() {
             auto_accum += get_frame_time() as f64;
             while auto_accum >= AUTO_STEP_INTERVAL {
                 auto_accum -= AUTO_STEP_INTERVAL;
-                grow_cycle(&mut graph, &mut sources, &mut t);
+                grow_cycle(&mut graph, &mut sources, &mut t, mode);
                 cycle += 1;
             }
         }
@@ -856,13 +1017,18 @@ async fn main() {
         draw_sources(&sources, &fit, source_blue);
         draw_vein_graph(&graph, &radii, &fit, vein_green, node_yellow);
 
+        let mode_name = match mode {
+            VenationMode::Open => "OPEN (tree)",
+            VenationMode::Closed => "CLOSED (reticulate)",
+        };
+        let loops = (graph.edges.len() + 1).saturating_sub(graph.nodes.len());
         let hud_title = format!(
-            "Step 5: Murray's-law vein widths   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
+            "Step 6: {mode_name}   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
             if auto { "on" } else { "off" }
         );
         draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
         let hud_veins = format!(
-            "vein nodes = {}  edges = {}   |   n = {MURRAY_EXPONENT:.1}  r0 = {TIP_RADIUS:.1}  max radius = {max_radius:.1}",
+            "vein nodes = {}  edges = {}  loops = {loops}   |   n = {MURRAY_EXPONENT:.1}  max radius = {max_radius:.1}",
             graph.nodes.len(),
             graph.edges.len()
         );
@@ -878,7 +1044,7 @@ async fn main() {
         );
         draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
         draw_text(
-            "[space] play/pause   [c] one cycle   [r] reset   (veins thicken tip->base by Murray's law)",
+            "[space] play/pause   [c] one cycle   [o] open/closed   [r] reset   (closed = veins loop into anastomoses)",
             20.0,
             screen_height() - 16.0,
             20.0,
