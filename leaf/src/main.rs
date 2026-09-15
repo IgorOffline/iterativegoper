@@ -270,6 +270,10 @@ const MURRAY_EXPONENT: f64 = 3.0;
 const TIP_RADIUS: f64 = 1.0;
 const VEIN_WIDTH_PX: f32 = 1.4;
 
+const MATERIAL_COLOR_RED: Color = Color::new(0.878, 0.204, 0.165, 1.0); // #E0342A
+const MATERIAL_COLOR_BLUE: Color = Color::new(0.000, 0.478, 0.808, 1.0); // #007ACE
+const MATERIAL_COLOR_YELLOW: Color = Color::new(0.522, 0.471, 0.000, 1.0); // #857800
+
 const MERGE_DISTANCE: f64 = 0.022;
 
 const SPATIAL_INDEX_MIN_NODES: usize = 1500;
@@ -924,6 +928,56 @@ fn to_screen(p: &Point, fit: &Fit) -> (f32, f32) {
     (sx, sy)
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+struct Placement {
+    scale: f64,
+    angle: f64,
+    tx: f64,
+    ty: f64,
+}
+
+impl Placement {
+    fn identity() -> Self {
+        Placement {
+            scale: 1.0,
+            angle: 0.0,
+            tx: 0.0,
+            ty: 0.0,
+        }
+    }
+
+    fn apply(&self, p: &Point) -> Point {
+        let (s, c) = self.angle.sin_cos();
+        let x = self.scale * p.x.ada;
+        let y = self.scale * p.y.ada;
+        Point::new(
+            PointX {
+                ada: self.tx + c * x - s * y,
+            },
+            PointY {
+                ada: self.ty + s * x + c * y,
+            },
+        )
+    }
+
+    fn compose(&self, parent: &Placement) -> Placement {
+        let base = parent.apply(&Point::new(
+            PointX { ada: self.tx },
+            PointY { ada: self.ty },
+        ));
+        Placement {
+            scale: parent.scale * self.scale,
+            angle: parent.angle + self.angle,
+            tx: base.x.ada,
+            ty: base.y.ada,
+        }
+    }
+}
+
+fn to_screen_p(p: &Point, place: &Placement, fit: &Fit) -> (f32, f32) {
+    to_screen(&place.apply(p), fit)
+}
+
 fn draw_polyline(pts: &[Point], fit: &Fit, color: Color, thick: f32, closed: bool) {
     if pts.len() < 2 {
         return;
@@ -940,11 +994,58 @@ fn draw_polyline(pts: &[Point], fit: &Fit, color: Color, thick: f32, closed: boo
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct TierColors {
+    tier1: bool, // trunk / primary veins  -> Material Red
+    tier2: bool, // mid / secondary veins  -> Material Blue
+    tier3: bool, // twig / tertiary veins  -> Material Yellow
+}
+
+impl TierColors {
+    fn none() -> Self {
+        TierColors {
+            tier1: false,
+            tier2: false,
+            tier3: false,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.tier1 || self.tier2 || self.tier3
+    }
+}
+
+fn vein_tier(radius: f64, max_radius: f64) -> u8 {
+    if max_radius <= 0.0 {
+        return 2;
+    }
+    let frac = radius / max_radius;
+    if frac >= 2.0 / 3.0 {
+        0
+    } else if frac >= 1.0 / 3.0 {
+        1
+    } else {
+        2
+    }
+}
+
+fn edge_color(radius: f64, max_radius: f64, tiers: &TierColors, default_color: Color) -> Color {
+    match vein_tier(radius, max_radius) {
+        0 if tiers.tier1 => MATERIAL_COLOR_RED,
+        1 if tiers.tier2 => MATERIAL_COLOR_BLUE,
+        2 if tiers.tier3 => MATERIAL_COLOR_YELLOW,
+        _ => default_color,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_vein_graph(
     graph: &VeinGraph,
     radii: &[f64],
+    max_radius: f64,
+    tiers: &TierColors,
     fit: &Fit,
-    edge_color: Color,
+    default_edge: Color,
     node_color: Color,
 ) {
     for e in &graph.edges {
@@ -952,12 +1053,16 @@ fn draw_vein_graph(
         let b = &graph.nodes[e.to.ada].pos;
         let (x1, y1) = to_screen(a, fit);
         let (x2, y2) = to_screen(b, fit);
-        let w = if e.from.ada < e.to.ada {
-            (radii[e.to.ada] as f32 * VEIN_WIDTH_PX).max(1.0)
+        let (w, col) = if e.from.ada < e.to.ada {
+            let r = radii[e.to.ada];
+            (
+                (r as f32 * VEIN_WIDTH_PX).max(1.0),
+                edge_color(r, max_radius, tiers, default_edge),
+            )
         } else {
-            1.0
+            (1.0, default_edge)
         };
-        draw_line(x1, y1, x2, y2, w, edge_color);
+        draw_line(x1, y1, x2, y2, w, col);
     }
     if let Some(nd) = graph.nodes.first() {
         let (sx, sy) = to_screen(&nd.pos, fit);
@@ -978,6 +1083,152 @@ fn ref_bbox(t: f64) -> (f64, f64, f64, f64) {
     let sy = 1.25f64.powf(t);
     let hx = 0.42 * sx * 1.15;
     (-hx, hx, 0.0, Y0_MAX * sy * 1.15)
+}
+
+fn draw_polyline_p(pts: &[Point], place: &Placement, fit: &Fit, color: Color, thick: f32) {
+    if pts.len() < 2 {
+        return;
+    }
+    for w in pts.windows(2) {
+        let (x1, y1) = to_screen_p(&w[0], place, fit);
+        let (x2, y2) = to_screen_p(&w[1], place, fit);
+        draw_line(x1, y1, x2, y2, thick, color);
+    }
+    let (x1, y1) = to_screen_p(&pts[pts.len() - 1], place, fit);
+    let (x2, y2) = to_screen_p(&pts[0], place, fit);
+    draw_line(x1, y1, x2, y2, thick, color);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_vein_graph_p(
+    graph: &VeinGraph,
+    radii: &[f64],
+    max_radius: f64,
+    tiers: &TierColors,
+    place: &Placement,
+    fit: &Fit,
+    default_color: Color,
+) {
+    for e in &graph.edges {
+        let a = &graph.nodes[e.from.ada].pos;
+        let b = &graph.nodes[e.to.ada].pos;
+        let (x1, y1) = to_screen_p(a, place, fit);
+        let (x2, y2) = to_screen_p(b, place, fit);
+        let (w, col) = if e.from.ada < e.to.ada {
+            let r = radii[e.to.ada];
+            (
+                (r as f32 * place.scale as f32 * VEIN_WIDTH_PX).max(0.75),
+                edge_color(r, max_radius, tiers, default_color),
+            )
+        } else {
+            (0.75, default_color)
+        };
+        draw_line(x1, y1, x2, y2, w, col);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_leaflet(
+    outline: &[Point],
+    graph: &VeinGraph,
+    radii: &[f64],
+    max_radius: f64,
+    tiers: &TierColors,
+    place: &Placement,
+    fit: &Fit,
+    leaf_color: Color,
+    vein_color: Color,
+) {
+    draw_polyline_p(
+        outline,
+        place,
+        fit,
+        leaf_color,
+        (2.5 * place.scale as f32).max(1.0),
+    );
+    draw_vein_graph_p(graph, radii, max_radius, tiers, place, fit, vein_color);
+}
+
+fn leaflet_placements(order: u8) -> Vec<Placement> {
+    if order == 0 {
+        return vec![Placement::identity()];
+    }
+    let one = pinnate_placements();
+    if order == 1 {
+        return one;
+    }
+    let mut two = Vec::new();
+    for parent in &one {
+        for child in &one {
+            two.push(child.compose(parent));
+        }
+    }
+    two
+}
+
+fn draw_rachis(order: u8, fit: &Fit, color: Color) {
+    let axis = |pl: &Placement, fit: &Fit| {
+        let a = pl.apply(&Point::new(PointX { ada: 0.0 }, PointY { ada: 0.0 }));
+        let b = pl.apply(&Point::new(PointX { ada: 0.0 }, PointY { ada: 1.0 }));
+        let (x1, y1) = to_screen(&a, fit);
+        let (x2, y2) = to_screen(&b, fit);
+        draw_line(x1, y1, x2, y2, 1.5, color);
+    };
+    axis(&Placement::identity(), fit);
+    if order == 2 {
+        for parent in &pinnate_placements() {
+            axis(parent, fit);
+        }
+    }
+}
+
+fn compound_bbox(base: (f64, f64, f64, f64), places: &[Placement]) -> (f64, f64, f64, f64) {
+    let (bminx, bmaxx, bminy, bmaxy) = base;
+    let corners = [
+        (bminx, bminy),
+        (bmaxx, bminy),
+        (bminx, bmaxy),
+        (bmaxx, bmaxy),
+    ];
+    let mut minx = f64::INFINITY;
+    let mut maxx = f64::NEG_INFINITY;
+    let mut miny = f64::INFINITY;
+    let mut maxy = f64::NEG_INFINITY;
+    for pl in places {
+        for &(cx, cy) in &corners {
+            let q = pl.apply(&Point::new(PointX { ada: cx }, PointY { ada: cy }));
+            minx = minx.min(q.x.ada);
+            maxx = maxx.max(q.x.ada);
+            miny = miny.min(q.y.ada);
+            maxy = maxy.max(q.y.ada);
+        }
+    }
+    (minx, maxx, miny, maxy)
+}
+
+fn pinnate_placements() -> Vec<Placement> {
+    let pairs = 4usize;
+    let leaflet_scale = 0.42;
+    let spread = std::f64::consts::PI * 0.32;
+    let mut ps = Vec::new();
+    for k in 0..pairs {
+        let along = (k as f64 + 1.0) / (pairs as f64 + 1.0);
+        for side in [-1.0f64, 1.0] {
+            ps.push(Placement {
+                scale: leaflet_scale,
+                angle: side * spread,
+                tx: 0.0,
+                ty: along,
+            });
+        }
+    }
+    ps.push(Placement {
+        scale: leaflet_scale,
+        angle: 0.0,
+        tx: 0.0,
+        ty: 1.0,
+    });
+    ps
 }
 
 #[macroquad::main("Nonuniform leaf growth")]
@@ -1010,6 +1261,8 @@ async fn main() {
     let mut t = T0;
     let mut cycle = 0usize;
     let mut mode = VenationMode::Open;
+    let mut order: u8 = 0; // compounding order: 0 simple, 1 compound, 2 bipinnate
+    let mut tiers = TierColors::none(); // Q/W/E vein-tier recolor toggles
 
     let mut auto = true;
     let mut auto_accum = 0.0f64;
@@ -1141,6 +1394,25 @@ async fn main() {
             cycle = 0;
             auto = true;
         }
+        // A / S / D select the compounding order (simple / compound / bipinnate).
+        if is_key_pressed(KeyCode::A) {
+            order = 0;
+        }
+        if is_key_pressed(KeyCode::S) {
+            order = 1;
+        }
+        if is_key_pressed(KeyCode::D) {
+            order = 2;
+        }
+        if is_key_pressed(KeyCode::Q) {
+            tiers.tier1 = !tiers.tier1;
+        }
+        if is_key_pressed(KeyCode::W) {
+            tiers.tier2 = !tiers.tier2;
+        }
+        if is_key_pressed(KeyCode::E) {
+            tiers.tier3 = !tiers.tier3;
+        }
         if auto && t < T_MAX {
             auto_accum += get_frame_time() as f64;
             while auto_accum >= AUTO_STEP_INTERVAL {
@@ -1153,17 +1425,6 @@ async fn main() {
         let map_t = model.vertical_map(t, Y0_MAX, N_STEPS);
         let outline = propagate_from_ref(&model, &outline_ref, &map_t0, &map_t, t);
 
-        let fit = fit_world(ref_bbox(T_MAX));
-
-        clear_background(Color::new(0.08, 0.09, 0.11, 1.0));
-
-        draw_polyline(&outline, &fit, leaf_green, 2.5, true);
-
-        for &p in outline.iter().step_by(66) {
-            let (sx, sy) = to_screen(&p, &fit);
-            draw_circle(sx, sy, 2.5, leaf_green);
-        }
-
         let radii = murray_radii(
             &graph,
             MurrayExponent {
@@ -1173,8 +1434,35 @@ async fn main() {
         );
         let max_radius = radii.iter().cloned().fold(0.0f64, f64::max);
 
-        draw_sources(&sources, &fit, source_blue);
-        draw_vein_graph(&graph, &radii, &fit, vein_green, node_yellow);
+        let places = leaflet_placements(order);
+        let fit = fit_world(compound_bbox(ref_bbox(T_MAX), &places));
+
+        clear_background(Color::new(0.08, 0.09, 0.11, 1.0));
+
+        if order == 0 {
+            draw_polyline(&outline, &fit, leaf_green, 2.5, true);
+            for &p in outline.iter().step_by(66) {
+                let (sx, sy) = to_screen(&p, &fit);
+                draw_circle(sx, sy, 2.5, leaf_green);
+            }
+            draw_sources(&sources, &fit, source_blue);
+            draw_vein_graph(
+                &graph,
+                &radii,
+                max_radius,
+                &tiers,
+                &fit,
+                vein_green,
+                node_yellow,
+            );
+        } else {
+            draw_rachis(order, &fit, vein_green);
+            for pl in &places {
+                draw_leaflet(
+                    &outline, &graph, &radii, max_radius, &tiers, pl, &fit, leaf_green, vein_green,
+                );
+            }
+        }
 
         let mode_name = match mode {
             VenationMode::Open => "open",
@@ -1191,15 +1479,21 @@ async fn main() {
             VenationMode::Open if graph.nodes.len() >= SPATIAL_INDEX_MIN_NODES => "Delaunay",
             VenationMode::Open => "linear",
         };
+        let order_name = match order {
+            0 => "0: simple",
+            1 => "1: compound (pinnate leaflets)",
+            _ => "2: bipinnate (pinnules)",
+        };
         let hud_title = format!(
-            "Step 7+8: form = {form_name}   t = {t:.2} / {T_MAX:.1}   cycle = {cycle}   [auto: {}]",
+            "order {order_name}   |   form = {form_name}   t = {t:.2}   cycle = {cycle}   [auto: {}]",
             if auto { "on" } else { "off" }
         );
         draw_text(&hud_title, 20.0, 30.0, 26.0, WHITE);
         let hud_veins = format!(
-            "venation = {mode_name} [{accel} NN]  |  nodes = {}  edges = {}  loops = {loops}  n = {MURRAY_EXPONENT:.1}  max r = {max_radius:.1}",
+            "venation = {mode_name} [{accel} NN]  |  nodes = {}  edges = {}  loops = {loops}  max r = {max_radius:.1}  leaflets = {}",
             graph.nodes.len(),
-            graph.edges.len()
+            graph.edges.len(),
+            places.len()
         );
         draw_text(&hud_veins, 20.0, 56.0, 22.0, node_yellow);
         let phase = if t >= T_MAX {
@@ -1207,13 +1501,26 @@ async fn main() {
         } else {
             ""
         };
-        let hud_sources = format!(
-            "auxin sources active = {}   (seeded into newly-grown blade each cycle){phase}",
-            sources.len()
-        );
+        let hud_sources = if order == 0 {
+            format!(
+                "auxin sources active = {}   (seeded into newly-grown blade each cycle){phase}",
+                sources.len()
+            )
+        } else {
+            format!("each leaflet is the same grown blade under a placement transform{phase}")
+        };
         draw_text(&hud_sources, 20.0, 82.0, 22.0, source_blue);
+        let tier_state = |on: bool| if on { "on" } else { "off" };
+        let hud_tiers = format!(
+            "vein tiers:  [Q] primary={} (red)   [W] secondary={} (blue)   [E] tertiary={} (yellow)",
+            tier_state(tiers.tier1),
+            tier_state(tiers.tier2),
+            tier_state(tiers.tier3),
+        );
+        let hud_tier_color = if tiers.any() { WHITE } else { GRAY };
+        draw_text(&hud_tiers, 20.0, 108.0, 22.0, hud_tier_color);
         draw_text(
-            "[m] leaf form   [o] open/closed   [space] play/pause   [c] one cycle   [r] reset",
+            "[A/S/D] order 0/1/2   [Q/W/E] tier colors   [m] form   [o] open/closed   [space] play   [c] cycle   [r] reset",
             20.0,
             screen_height() - 16.0,
             20.0,
