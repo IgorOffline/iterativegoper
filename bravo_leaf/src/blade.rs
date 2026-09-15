@@ -9,3 +9,14 @@ pub fn leaf_half_width(height: f64) -> f64 {
 pub fn point_in_blade(point: Point) -> bool {
     (0.0..=Y0_MAX).contains(&point.y) && point.x.abs() <= leaf_half_width(point.y)
 }
+
+pub fn random_blade_point() -> Point {
+    loop {
+        let height = ::rand::random_range(0.0..Y0_MAX);
+        let half_width = leaf_half_width(height);
+        let candidate = Point::new(::rand::random_range(-half_width..=half_width), height);
+        if point_in_blade(candidate) {
+            return candidate;
+        }
+    }
+}
