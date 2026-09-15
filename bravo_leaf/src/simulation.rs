@@ -14,12 +14,13 @@ pub struct Simulation {
     time: f64,
     accumulated_time: f64,
     color: Color,
+    screen_offset: (f32, f32),
 }
 
 impl Simulation {
-    pub fn new(seed: u64, color: Color) -> Self {
+    pub fn new(seed: u64, color: Color, root: Point, screen_offset: (f32, f32)) -> Self {
         rand::srand(seed);
-        let graph = VeinGraph::seed();
+        let graph = VeinGraph::seed(root);
         let sources = throw_darts(&graph.nodes, DART_ATTEMPTS);
         Simulation {
             graph,
@@ -27,6 +28,7 @@ impl Simulation {
             time: T0,
             accumulated_time: 0.0,
             color,
+            screen_offset,
         }
     }
 
@@ -82,7 +84,8 @@ impl Simulation {
         clear_background(BACKGROUND);
         let radii = murray_radii(&self.graph);
         let scale = RadiusScale::new(radii.iter().cloned().fold(0.0f64, f64::max));
-        let fit = fit_world(reference_bounding_box(T_MAX));
+        let fit = fit_world(reference_bounding_box(T_MAX))
+            .translated(self.screen_offset.0, self.screen_offset.1 - 105.0);
 
         for &(from, to) in &self.graph.edges {
             let radius = radii[to];

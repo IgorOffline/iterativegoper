@@ -23,6 +23,14 @@ pub fn fit_world(bounds: BoundingBox) -> ViewportFit {
     }
 }
 
+impl ViewportFit {
+    pub fn translated(mut self, offset_x: f32, offset_y: f32) -> Self {
+        self.origin_x += offset_x;
+        self.origin_y += offset_y;
+        self
+    }
+}
+
 pub fn to_screen(point: Point, fit: &ViewportFit) -> (f32, f32) {
     (
         fit.origin_x + point.x as f32 * fit.scale,

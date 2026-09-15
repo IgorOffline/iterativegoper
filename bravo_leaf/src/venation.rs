@@ -11,9 +11,9 @@ pub struct VeinGraph {
 }
 
 impl VeinGraph {
-    pub fn seed() -> Self {
+    pub fn seed(root: Point) -> Self {
         VeinGraph {
-            nodes: vec![Point::new(0.0, 0.0)],
+            nodes: vec![root],
             edges: Vec::new(),
         }
     }
