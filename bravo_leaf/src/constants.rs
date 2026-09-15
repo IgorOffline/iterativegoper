@@ -1,6 +1,13 @@
 use macroquad::prelude::Color;
 
-pub const SEED: u64 = 0x1EA_F_C0FFEE;
+pub const SEEDS: [u64; 6] = [
+    0x1EA_F_C0FFEE,
+    0xB105_EED5_0DDBA11,
+    0x0FF1CE_C0DE_CAFE,
+    0xACE1_DEAD_BEEF_F00D,
+    0xDEC0DED_1EAF_D00D,
+    0xFACADE_D15EA5ED,
+];
 
 pub const T0: f64 = 0.0;
 pub const T_MAX: f64 = 4.0;

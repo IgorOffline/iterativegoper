@@ -16,8 +16,8 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    pub fn new() -> Self {
-        rand::srand(SEED);
+    pub fn new(seed: u64) -> Self {
+        rand::srand(seed);
         let graph = VeinGraph::seed();
         let sources = throw_darts(&graph.nodes, DART_ATTEMPTS);
         Simulation {
