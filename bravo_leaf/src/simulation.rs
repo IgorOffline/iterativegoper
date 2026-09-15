@@ -1,4 +1,4 @@
-use macroquad::prelude::{clear_background, draw_line, rand};
+use macroquad::prelude::{Color, clear_background, draw_line, rand};
 
 use crate::constants::*;
 use crate::geometry::Point;
@@ -13,10 +13,11 @@ pub struct Simulation {
     sources: Vec<Point>,
     time: f64,
     accumulated_time: f64,
+    color: Color,
 }
 
 impl Simulation {
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: u64, color: Color) -> Self {
         rand::srand(seed);
         let graph = VeinGraph::seed();
         let sources = throw_darts(&graph.nodes, DART_ATTEMPTS);
@@ -25,6 +26,7 @@ impl Simulation {
             sources,
             time: T0,
             accumulated_time: 0.0,
+            color,
         }
     }
 
@@ -95,7 +97,7 @@ impl Simulation {
                 to_x,
                 to_y,
                 (radius as f32 * VEIN_WIDTH_PX).max(1.0),
-                MATERIAL_COLOR_BLUE,
+                self.color,
             );
         }
     }
