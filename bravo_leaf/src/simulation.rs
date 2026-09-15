@@ -1,4 +1,4 @@
-use macroquad::prelude::{Color, clear_background, draw_line, rand};
+use macroquad::prelude::{Color, draw_line, rand};
 
 use crate::constants::*;
 use crate::geometry::Point;
@@ -15,6 +15,7 @@ pub struct Simulation {
     accumulated_time: f64,
     color: Color,
     screen_offset: (f32, f32),
+    lifetime: f64,
 }
 
 impl Simulation {
@@ -29,6 +30,7 @@ impl Simulation {
             accumulated_time: 0.0,
             color,
             screen_offset,
+            lifetime: 0.0,
         }
     }
 
@@ -70,6 +72,7 @@ impl Simulation {
     }
 
     pub fn step(&mut self, delta_time: f64) {
+        self.lifetime += delta_time;
         if self.time >= T_MAX {
             return;
         }
@@ -80,8 +83,18 @@ impl Simulation {
         }
     }
 
+    pub fn is_expired(&self) -> bool {
+        self.lifetime >= SUBJECT_LIFESPAN
+    }
+
+    fn fade_alpha(&self) -> f32 {
+        let remaining = SUBJECT_LIFESPAN - self.lifetime;
+        (remaining / SUBJECT_FADE).clamp(0.0, 1.0) as f32
+    }
+
     pub fn draw(&self) {
-        clear_background(BACKGROUND);
+        let mut color = self.color;
+        color.a = self.fade_alpha();
         let radii = murray_radii(&self.graph);
         let scale = RadiusScale::new(radii.iter().cloned().fold(0.0f64, f64::max));
         let fit = fit_world(reference_bounding_box(T_MAX))
@@ -100,7 +113,7 @@ impl Simulation {
                 to_x,
                 to_y,
                 (radius as f32 * VEIN_WIDTH_PX).max(1.0),
-                self.color,
+                color,
             );
         }
     }
