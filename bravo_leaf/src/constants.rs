@@ -39,7 +39,7 @@ pub const TIP_RADIUS: f64 = 1.0;
 pub const VEIN_WIDTH_PX: f32 = 1.4;
 
 pub const SUBJECT_LIFESPAN: f64 = 6.0;
-pub const SUBJECT_SPAWN_INTERVAL: f64 = 4.0;
+pub const SUBJECT_SPAWN_INTERVAL: f64 = 2.0;
 pub const SUBJECT_FADE: f64 = 1.0;
 
 pub const BACKGROUND: Color = Color::new(0.08, 0.09, 0.11, 1.0);

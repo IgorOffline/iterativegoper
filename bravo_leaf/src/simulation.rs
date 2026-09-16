@@ -71,6 +71,12 @@ impl Simulation {
         }
     }
 
+    pub fn grow_to_maturity(&mut self) {
+        while self.time < T_MAX {
+            self.grow_cycle();
+        }
+    }
+
     pub fn step(&mut self, delta_time: f64) {
         self.lifetime += delta_time;
         if self.time >= T_MAX {
